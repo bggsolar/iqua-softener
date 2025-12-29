@@ -3,23 +3,24 @@ import time
 from enum import Enum, IntEnum
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List, Tuple
 
 try:
     from zoneinfo import ZoneInfo
 except Exception:
-    from backports.zoneinfo import ZoneInfo
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_BASE_URL = "https://apioem.ecowater.com/v1"
-DEFAULT_USER_AGENT = "okhttp/4.9.1"
+# New iQua API base (found via DevTools)
+DEFAULT_API_BASE_URL = "https://api.myiquaapp.com/v1"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (HomeAssistant; iqua-softener) requests"
 
-# New: request timeout + token refresh margin
-DEFAULT_TIMEOUT_SECONDS = 10
-TOKEN_REFRESH_MARGIN_SECONDS = 60
+DEFAULT_TIMEOUT_SECONDS = 20
+RETRY_BACKOFF_SECONDS = 1.0
+RETRY_MAX_ATTEMPTS = 3
 
 
 class IquaSoftenerState(str, Enum):
@@ -56,6 +57,18 @@ class IquaSoftenerData:
 
 
 class IquaSoftener:
+    """
+    Updated client for api.myiquaapp.com.
+
+    Auth:
+      POST /auth/login with JSON { email, password }
+      Response includes access_token, refresh_token
+
+    Data:
+      GET /devices/{uuid}/debug -> groups/items structure (DeviceDebugInfo)
+      We map key values to the previously used IquaSoftenerData fields.
+    """
+
     def __init__(
         self,
         username: str,
@@ -64,193 +77,311 @@ class IquaSoftener:
         api_base_url: str = DEFAULT_API_BASE_URL,
         user_agent: str = DEFAULT_USER_AGENT,
     ):
-        self._username: str = username
+        # Backward compatible: username is email now
+        self._email: str = username
         self._password: str = password
-        self._device_serial_number = device_serial_number
-        self._api_base_url: str = api_base_url
+        self._device_id: str = device_serial_number  # this is UUID in new system
+        self._api_base_url: str = api_base_url.rstrip("/")
         self._user_agent: str = user_agent
-        self._token: Optional[str] = None
-        self._token_type: Optional[str] = None
-        self._token_expiration_timestamp: Optional[datetime] = None
+
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
 
     @property
     def device_serial_number(self) -> str:
-        return self._device_serial_number
+        # keep property name for old consumers
+        return self._device_id
+
+    # ----------------------------
+    # Public API used by HA
+    # ----------------------------
 
     def get_data(self) -> IquaSoftenerData:
         with requests.Session() as session:
-            self._check_token(session)
-            url = self._get_url(f"system/{self._device_serial_number}/dashboard")
-            headers = self._get_headers()
-            response = session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
+            self._ensure_login(session)
 
-            if response.status_code == 401:
-                # Token likely expired/invalid -> refresh once and retry
-                self._update_token(session)
-                headers = self._get_headers()
-                response = session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
-            elif response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for data request"
-                )
+            debug = self._get_device_debug(session)
+            kv = self._extract_kv_map(debug)
 
-            if response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for data request"
-                )
+            now = datetime.now()
 
-            response_data = response.json()
-            if response_data.get("code") != "OK":
-                raise IquaSoftenerException(
-                    f'Invalid response code for data request: {response_data["code"]} ({response_data["message"]})'
-                )
+            # Model
+            model = kv.get("model") or "iQua"
 
-            data = response_data["data"]
+            # Device/controller time
+            controller_time = kv.get("controller_time")  # e.g. "16:37"
+            # "time_message_received" is "29/12/2025 16:37" (dd/mm/yyyy hh:mm)
+            received = kv.get("time_message_received")
+
+            tz = ZoneInfo("Europe/Berlin")  # best-effort; API doesn't provide tz in debug payload you shared
+            device_dt = self._parse_device_datetime(received, controller_time, tz, fallback=now)
+
+            # Units
+            volume_units = (kv.get("volume_units") or "").strip().lower()
+            volume_unit = IquaSoftenerVolumeUnit.LITERS if "liter" in volume_units else IquaSoftenerVolumeUnit.GALLONS
+
+            # Values we can map reliably from debug:
+            # water_today, average_daily_use, treated_water_left, current_flow_rate
+            today_use = self._to_int(kv.get("water_today"), default=0)
+            avg_daily = self._to_int(kv.get("average_daily_use"), default=0)
+            total_available = self._to_int(kv.get("treated_water_left"), default=0)
+            current_flow = self._to_float(kv.get("current_flow_rate"), default=0.0)
+
+            # Salt monitor
+            salt_level_percent = self._to_int(kv.get("salt_monitor_level"), default=0)
+            out_of_salt_days = self._to_int(kv.get("out_of_salt_days"), default=0)
+
+            # Hardness (PPM). Old library used "grains" – we map PPM -> grains approx if needed.
+            hardness_ppm = self._to_float(kv.get("hardness"), default=0.0)
+            # 1 gpg (grain/gal) ≈ 17.1 ppm as CaCO3
+            hardness_grains = int(round(hardness_ppm / 17.1)) if hardness_ppm else 0
+
+            # Days since last regen: we have "time_since_last_recharge" in days (string "1")
+            days_since_regen = self._to_int(kv.get("time_since_last_recharge"), default=0)
+
+            # Salt level (absolute) isn't present directly in debug (you have salt_total etc.).
+            # Keep as 0 unless you want "salt_total" (kg) to be used.
+            salt_level = 0
+
+            # Valve state: debug contains "valve_position" (Service/Backwash/...) but not explicit shutoff state.
+            # Keep as 0 for compatibility.
+            valve_state = 0
+
+            # State: no explicit online/offline in debug. Use ONLINE as best-effort.
+            state = IquaSoftenerState.ONLINE
+
             return IquaSoftenerData(
-                timestamp=datetime.now(),
-                model=f'{data["modelDescription"]["value"]} ({data["modelId"]["value"]})',
-                state=IquaSoftenerState(data["power"]),
-                device_date_time=datetime.fromisoformat(
-                    data["deviceDate"][: len(data["deviceDate"]) - 1]
-                ).replace(tzinfo=ZoneInfo(data["timeZoneEnum"]["value"])),
-                volume_unit=IquaSoftenerVolumeUnit(int(data["volumeUnitEnum"]["value"])),
-                current_water_flow=float(data["currentWaterFlow"]["value"]),
-                today_use=int(data["gallonsUsedToday"]["value"]),
-                average_daily_use=int(data["avgDailyUseGallons"]["value"]),
-                total_water_available=int(data["totalWaterAvailGals"]["value"]),
-                days_since_last_regeneration=int(data["daysSinceLastRegen"]["value"]),
-                salt_level=int(int(data["saltLevelTenths"]["value"]) / 10),
-                salt_level_percent=int(data["saltLevelTenths"]["percent"]),
-                out_of_salt_estimated_days=int(data["outOfSaltEstDays"]["value"]),
-                hardness_grains=int(data["hardnessGrains"]["value"]),
-                water_shutoff_valve_state=int(data["waterShutoffValveReq"]["value"]),
+                timestamp=now,
+                model=str(model),
+                state=state,
+                device_date_time=device_dt,
+                volume_unit=volume_unit,
+                current_water_flow=current_flow,
+                today_use=today_use,
+                average_daily_use=avg_daily,
+                total_water_available=total_available,
+                days_since_last_regeneration=days_since_regen,
+                salt_level=salt_level,
+                salt_level_percent=salt_level_percent,
+                out_of_salt_estimated_days=out_of_salt_days,
+                hardness_grains=hardness_grains,
+                water_shutoff_valve_state=valve_state,
             )
 
     def set_water_shutoff_valve(self, state: int):
-        if state not in (0, 1):
-            raise ValueError("Invalid state for water shut off valve (should be 0 or 1).")
+        # New API endpoint unknown; keep explicit message
+        raise IquaSoftenerException(
+            "set_water_shutoff_valve is not implemented for api.myiquaapp.com yet."
+        )
 
-        with requests.Session() as session:
-            self._check_token(session)
-            url = self._get_url(f"system/{self._device_serial_number}/properties")
-            headers = self._get_headers()
-            json_payload = {"waterShutoffValve": state}
+    # ----------------------------
+    # Auth + HTTP helpers
+    # ----------------------------
 
-            response = session.put(
-                url,
-                json=json_payload,
-                headers=headers,
-                timeout=DEFAULT_TIMEOUT_SECONDS,
+    def _ensure_login(self, session: requests.Session) -> None:
+        if self._access_token is None:
+            self._login(session)
+
+    def _login(self, session: requests.Session) -> None:
+        url = self._get_url("auth/login")
+        payload = {"email": self._email, "password": self._password}
+
+        resp = self._request_with_retries(
+            session,
+            method="POST",
+            url=url,
+            headers=self._get_headers(with_auth=False),
+            json=payload,
+        )
+
+        if resp.status_code != 200:
+            raise IquaSoftenerException(f"Login failed: HTTP {resp.status_code}")
+
+        data = resp.json()
+        access = data.get("access_token")
+        refresh = data.get("refresh_token")
+        if not access:
+            raise IquaSoftenerException(
+                f"Login response missing access_token. Keys: {sorted(list(data.keys()))}"
             )
+        self._access_token = access
+        self._refresh_token = refresh
 
-            if response.status_code == 401:
-                self._update_token(session)
-                headers = self._get_headers()
-                response = session.put(
-                    url,
-                    json=json_payload,
-                    headers=headers,
-                    timeout=DEFAULT_TIMEOUT_SECONDS,
-                )
-            elif response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for set water shutoff valve request"
-                )
-
-            if response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for set water shutoff valve request"
-                )
-
-            response_data = response.json()
-            if response_data.get("code") != "OK":
-                raise IquaSoftenerException(
-                    f'Invalid response code for set water shutoff valve request: {response_data["code"]} '
-                    f'({response_data["message"]})'
-                )
-
-    def _check_token(self, session: requests.Session):
-        # Refresh token if missing or (nearly) expired.
-        # Margin avoids edge cases where token expires between calls.
-        if self._token is None:
-            self._update_token(session)
-            return
-
-        if self._token_expiration_timestamp is not None:
-            if datetime.now() >= (
-                self._token_expiration_timestamp - timedelta(seconds=TOKEN_REFRESH_MARGIN_SECONDS)
-            ):
-                self._update_token(session)
-
-    def _update_token(self, session: requests.Session):
-        # Token endpoint can be flaky (e.g. 502 gateway errors). Retry a few times with backoff.
-        backoff_seconds = 1.0
+    def _request_with_retries(
+        self,
+        session: requests.Session,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        json: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
+        backoff = RETRY_BACKOFF_SECONDS
         last_exc: Optional[Exception] = None
 
-        for attempt in range(1, 4):  # 3 attempts
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
-                response = session.post(
-                    self._get_url("auth/signin"),
-                    json=dict(username=self._username, password=self._password),
-                    headers=self._get_headers(with_authorization=False),
+                resp = session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json,
                     timeout=DEFAULT_TIMEOUT_SECONDS,
                 )
+                if resp.status_code in (502, 503, 504, 429):
+                    logger.warning(
+                        "HTTP %s on %s (attempt %s/%s)",
+                        resp.status_code,
+                        url,
+                        attempt,
+                        RETRY_MAX_ATTEMPTS,
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return resp
             except requests.exceptions.RequestException as ex:
                 last_exc = ex
-                logger.warning("Token request failed (attempt %s/3): %s", attempt, ex)
-                time.sleep(backoff_seconds)
-                backoff_seconds *= 2
-                continue
-
-            if response.status_code == 401:
-                # Credentials or account problem -> do not retry.
-                raise IquaSoftenerException(f"Authentication error ({response.text})")
-
-            if response.status_code in (502, 503, 504):
-                # Temporary backend issues -> retry.
                 logger.warning(
-                    "Token request temporary backend error %s (attempt %s/3).",
-                    response.status_code,
+                    "Request exception on %s (attempt %s/%s): %s",
+                    url,
                     attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    ex,
                 )
-                time.sleep(backoff_seconds)
-                backoff_seconds *= 2
-                continue
+                time.sleep(backoff)
+                backoff *= 2
 
-            if response.status_code != 200:
-                # Other errors likely not transient.
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for token request"
-                )
+        raise IquaSoftenerException(f"Request failed after retries: {url} ({last_exc})")
 
-            # Success
-            response_data = response.json()
-            if response_data.get("code") != "OK":
-                raise IquaSoftenerException(
-                    f'Invalid response code for token request: {response_data["code"]} ({response_data["message"]})'
-                )
+    def _authorized_get_json(self, session: requests.Session, url: str) -> Any:
+        headers = self._get_headers(with_auth=True)
+        resp = self._request_with_retries(session, "GET", url, headers=headers)
 
-            self._token = response_data["data"]["token"]
-            self._token_type = response_data["data"]["tokenType"]
-            self._token_expiration_timestamp = datetime.now() + timedelta(
-                seconds=int(response_data["data"]["expiresIn"])
+        if resp.status_code == 401:
+            # re-login once
+            self._access_token = None
+            self._login(session)
+            headers = self._get_headers(with_auth=True)
+            resp = self._request_with_retries(session, "GET", url, headers=headers)
+
+        if resp.status_code != 200:
+            raise IquaSoftenerException(
+                f"Invalid status ({resp.status_code}) for data request: {url}"
             )
-            return
 
-        # Retries exhausted
-        if last_exc is not None:
-            raise IquaSoftenerException(f"Exception on token request ({last_exc})")
-        raise IquaSoftenerException("Token request failed after retries")
+        return resp.json()
+
+    def _get_headers(self, with_auth: bool = True) -> Dict[str, str]:
+        headers = {
+            "User-Agent": self._user_agent,
+            "Accept": "application/json",
+        }
+        if with_auth and self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+        return headers
 
     def _get_url(self, resource: str) -> str:
-        return f"{self._api_base_url}/{resource}"
+        return f"{self._api_base_url}/{resource.lstrip('/')}"
 
-    def _get_headers(self, with_authorization: bool = True) -> Dict[str, str]:
-        headers = {"User-Agent": self._user_agent}
-        if (
-            with_authorization is True
-            and self._token is not None
-            and self._token_type is not None
-        ):
-            headers["Authorization"] = f"{self._token_type} {self._token}"
-        return headers
+    # ----------------------------
+    # Data: debug endpoint + parsing
+    # ----------------------------
+
+    def _get_device_debug(self, session: requests.Session) -> Dict[str, Any]:
+        url = self._get_url(f"devices/{self._device_id}/debug")
+        data = self._authorized_get_json(session, url)
+        if not isinstance(data, dict):
+            raise IquaSoftenerException("Unexpected debug payload type.")
+        return data
+
+    def _extract_kv_map(self, debug_payload: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Convert groups/items (kv + table) into a flat map:
+          kv_map[item.key] = item_kv.value
+        For tables we currently ignore; can be added later if desired.
+        """
+        kv_map: Dict[str, str] = {}
+        groups = debug_payload.get("groups", [])
+        if not isinstance(groups, list):
+            return kv_map
+
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            items = g.get("items", [])
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                it_key = it.get("key")
+                it_type = it.get("type")
+                if not it_key or not isinstance(it_key, str):
+                    continue
+
+                if it_type == "kv":
+                    kv = it.get("item_kv", {})
+                    if isinstance(kv, dict):
+                        val = kv.get("value")
+                        if val is None:
+                            continue
+                        kv_map[it_key] = str(val)
+                # tables exist (water usage history), ignore for now
+
+        return kv_map
+
+    # ----------------------------
+    # Parsing helpers
+    # ----------------------------
+
+    def _to_float(self, raw: Optional[str], default: float = 0.0) -> float:
+        if raw is None:
+            return default
+        s = str(raw).strip()
+        # strip units like "76.5%"
+        s = s.replace("%", "").strip()
+        # some values could include " Days"
+        s = s.replace("Days", "").strip()
+        try:
+            return float(s)
+        except Exception:
+            return default
+
+    def _to_int(self, raw: Optional[str], default: int = 0) -> int:
+        return int(round(self._to_float(raw, default=float(default))))
+
+    def _parse_device_datetime(
+        self,
+        received: Optional[str],
+        controller_time: Optional[str],
+        tz: ZoneInfo,
+        fallback: datetime,
+    ) -> datetime:
+        """
+        Best-effort:
+          - if received (dd/mm/yyyy hh:mm) exists -> parse it
+          - else if controller_time (hh:mm) exists -> use today's date with that time
+        """
+        if received:
+            s = received.strip()
+            # Example: "29/12/2025 16:37"
+            for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s, fmt).replace(tzinfo=tz)
+                    return dt
+                except Exception:
+                    pass
+
+        if controller_time:
+            s = controller_time.strip()
+            for fmt in ("%H:%M", "%H:%M:%S"):
+                try:
+                    t = datetime.strptime(s, fmt).time()
+                    dt = datetime.now(tz).replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=0)
+                    return dt
+                except Exception:
+                    pass
+
+        if fallback.tzinfo is None:
+            return fallback.replace(tzinfo=tz)
+        return fallback
